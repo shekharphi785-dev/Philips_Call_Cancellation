@@ -1,0 +1,6 @@
+{
+  "name": "Philips Cancellation Submission",
+  "description": "Collaborative case management portal for FSM field submissions and real-time CRM operations review with access control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
