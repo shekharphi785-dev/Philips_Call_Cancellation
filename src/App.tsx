@@ -35,6 +35,7 @@ import {
   Archive,
   RotateCcw,
   Shield,
+  ShieldCheck,
   Crown,
   Users,
   Edit3,
@@ -66,7 +67,7 @@ import {
 // Types & Schemas
 // ==========================================
 type ViewState = "LOGIN" | "SELECTION" | "FORM_VIEW";
-type FormMode = "cancellation" | "transfer";
+type FormMode = "cancellation" | "transfer" | "all";
 type MatrixTab = "new" | "uploaded";
 
 interface CancellationRow {
@@ -164,9 +165,36 @@ export default function App() {
     userEmail.trim().toLowerCase() === "shekharphi785@gmail.com";
   const canEditCases = isAdmin || userRole === "crm_editor";
 
+  // Real-time synchronization state across multiple users and tabs
+  const [syncStatus, setSyncStatus] = useState<"connected" | "syncing" | "offline">("connected");
+  const [lastSyncTime, setLastSyncTime] = useState<Date>(new Date());
+
+  // Restore saved session on initial app load (checks sessionStorage first so multiple tabs can be different accounts)
+  useEffect(() => {
+    try {
+      const saved =
+        sessionStorage.getItem("philips_portal_session") ||
+        localStorage.getItem("philips_portal_session");
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.email) {
+          setUserEmail(parsed.email);
+          setUserName(parsed.name || parsed.email);
+          setUserRole(parsed.role || "fsm");
+          setViewState(parsed.viewState || "SELECTION");
+          if (parsed.role === "crm_editor" || parsed.role === "admin") {
+            setMatrixTab("uploaded");
+          }
+        }
+      }
+    } catch {
+      // Ignore parse errors
+    }
+  }, []);
+
   // Fetch shared cases from backend
-  const fetchSharedCases = async () => {
-    setIsLoadingCases(true);
+  const fetchSharedCases = async (showLoading = true) => {
+    if (showLoading) setIsLoadingCases(true);
     try {
       const res = await fetch("/api/cases", {
         headers: {
@@ -176,19 +204,141 @@ export default function App() {
       const data = await res.json();
       if (res.ok && Array.isArray(data.cases)) {
         setSharedCases(data.cases);
+        setLastSyncTime(new Date());
+        setSyncStatus("connected");
       }
     } catch (e) {
       console.warn("Failed to fetch shared cases:", e);
+      setSyncStatus("syncing");
     } finally {
-      setIsLoadingCases(false);
+      if (showLoading) setIsLoadingCases(false);
     }
   };
 
+  // Real-time multi-user synchronization: SSE stream, BroadcastChannel, and background polling
   useEffect(() => {
-    if (viewState !== "LOGIN") {
-      fetchSharedCases();
+    if (viewState === "LOGIN") return;
+
+    fetchSharedCases(true);
+
+    let eventSource: EventSource | null = null;
+    let pollTimer: any = null;
+    let broadcastChannel: BroadcastChannel | null = null;
+
+    // 1. Cross-tab synchronization via BroadcastChannel
+    try {
+      broadcastChannel = new BroadcastChannel("philips_portal_sync_bus");
+      broadcastChannel.onmessage = (ev) => {
+        if (ev.data?.type === "REFRESH_CASES") {
+          fetchSharedCases(false);
+        }
+      };
+    } catch {
+      // BroadcastChannel not available
     }
-  }, [viewState, formMode]);
+
+    // 2. Real-time Server-Sent Events (SSE) connection
+    try {
+      eventSource = new EventSource("/api/sync/events");
+
+      eventSource.addEventListener("initial_sync", (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (Array.isArray(data.cases)) {
+            setSharedCases(data.cases);
+            setLastSyncTime(new Date());
+            setSyncStatus("connected");
+          }
+          if (Array.isArray(data.users) && userEmail) {
+            const myUser = data.users.find((u: any) => u.email.toLowerCase() === userEmail.toLowerCase());
+            if (myUser && myUser.role && myUser.role !== userRole) {
+              setUserRole(myUser.role);
+            }
+          }
+        } catch (err) {
+          console.warn("Initial sync error:", err);
+        }
+      });
+
+      eventSource.addEventListener("cases_updated", (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (Array.isArray(data.cases)) {
+            setSharedCases(data.cases);
+            setLastSyncTime(new Date());
+            setSyncStatus("connected");
+
+            // Live toast when another user submits or reviews cases
+            if (data.action === "cases_submitted" && data.submittedBy) {
+              const isMe = data.sampleCase?.submitterEmail?.toLowerCase() === userEmail.toLowerCase();
+              if (!isMe) {
+                setNotification({
+                  type: "success",
+                  message: `🔔 New ${data.mode || ""} case batch (${data.count || 1}) submitted by ${data.submittedBy}!`
+                });
+                setTimeout(() => setNotification(null), 5000);
+              }
+            } else if (data.action === "case_reviewed" && data.updatedCase) {
+              setNotification({
+                type: "success",
+                message: `⚡ Case ${data.updatedCase.caseNumber || ""} updated to "${data.updatedCase.crmStatus}" by ${data.editorName || "CRM Operations"}!`
+              });
+              setTimeout(() => setNotification(null), 5000);
+            }
+          }
+        } catch (err) {
+          console.warn("Case update sync error:", err);
+        }
+      });
+
+      eventSource.addEventListener("users_updated", (ev) => {
+        try {
+          const data = JSON.parse(ev.data);
+          if (Array.isArray(data.users) && userEmail) {
+            const myUser = data.users.find((u: any) => u.email.toLowerCase() === userEmail.toLowerCase());
+            if (myUser && myUser.role && myUser.role !== userRole) {
+              setUserRole(myUser.role);
+              setNotification({
+                type: "success",
+                message: `Account permissions updated: role is now ${myUser.role.toUpperCase()}`
+              });
+            }
+          }
+        } catch (err) {
+          console.warn("User update sync error:", err);
+        }
+      });
+
+      eventSource.addEventListener("ping", () => {
+        setSyncStatus("connected");
+      });
+
+      eventSource.onerror = () => {
+        setSyncStatus("syncing");
+      };
+    } catch (err) {
+      console.warn("SSE init error:", err);
+      setSyncStatus("syncing");
+    }
+
+    // 3. Fallback continuous polling (every 2.5s) to guarantee updates even if SSE is buffered
+    pollTimer = setInterval(() => {
+      fetchSharedCases(false);
+    }, 2500);
+
+    // 4. Focus trigger: immediately refresh when switching back to tab/window
+    const handleFocus = () => {
+      fetchSharedCases(false);
+    };
+    window.addEventListener("focus", handleFocus);
+
+    return () => {
+      if (eventSource) eventSource.close();
+      if (pollTimer) clearInterval(pollTimer);
+      if (broadcastChannel) broadcastChannel.close();
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [viewState, userEmail, userRole, formMode]);
 
   // Video Ref and HLS Initialization
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -327,12 +477,29 @@ export default function App() {
           userEmail.trim().toLowerCase() === "shekharphi785@gmail.com"
             ? "admin"
             : data.role || "fsm";
-        setUserName(data.name || userEmail);
+        const finalName = data.name || userEmail.split("@")[0];
+        setUserName(finalName);
         setUserRole(assignedRole);
         setViewState("SELECTION");
+
+        if (assignedRole === "crm_editor" || assignedRole === "admin") {
+          setMatrixTab("uploaded");
+        }
+
+        try {
+          const sessionPayload = JSON.stringify({
+            email: userEmail.trim().toLowerCase(),
+            name: finalName,
+            role: assignedRole,
+            viewState: "SELECTION"
+          });
+          sessionStorage.setItem("philips_portal_session", sessionPayload);
+          localStorage.setItem("philips_portal_session", sessionPayload);
+        } catch {}
+
         setNotification({
           type: "success",
-          message: `Authenticated as ${data.name || userEmail} (${
+          message: `Authenticated as ${finalName} (${
             assignedRole === "admin"
               ? "Administrator"
               : assignedRole === "crm_editor"
@@ -349,6 +516,73 @@ export default function App() {
       const errorMessage =
         err instanceof Error ? err.message : "Authentication error";
       setAuthError(errorMessage);
+    } finally {
+      setIsAuthenticating(false);
+    }
+  };
+
+  // 1-Click Demo Accounts Switcher (Instant Multi-Account Testing & Sync)
+  const handleQuickAccountSelect = async (
+    targetEmail: string,
+    targetName: string,
+    targetRole: UserRole
+  ) => {
+    setUserEmail(targetEmail);
+    setUserPassword("philips2026");
+    setIsAuthenticating(true);
+    setAuthError(null);
+
+    try {
+      const res = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          email: targetEmail,
+          password: "philips2026",
+          role: targetRole,
+          name: targetName
+        })
+      });
+
+      const data = await res.json().catch(() => ({}));
+      if (res.ok && data.success) {
+        const resolvedRole = data.role || targetRole;
+        const resolvedName = data.name || targetName;
+        setUserName(resolvedName);
+        setUserRole(resolvedRole);
+        setViewState("SELECTION");
+        if (resolvedRole === "crm_editor" || resolvedRole === "admin") {
+          setMatrixTab("uploaded");
+        }
+
+        const sessionPayload = JSON.stringify({
+          email: targetEmail,
+          name: resolvedName,
+          role: resolvedRole,
+          viewState: "SELECTION"
+        });
+
+        try {
+          sessionStorage.setItem("philips_portal_session", sessionPayload);
+          localStorage.setItem("philips_portal_session", sessionPayload);
+        } catch {}
+
+        setNotification({
+          type: "success",
+          message: `Logged in as ${resolvedName} (${
+            resolvedRole === "admin"
+              ? "Administrator"
+              : resolvedRole === "crm_editor"
+              ? "CRM Reviewer & Editor"
+              : "FSM Submitter"
+          }). Multi-account live sync ready.`
+        });
+        setTimeout(() => setNotification(null), 4000);
+      } else {
+        setAuthError(data.error || "Failed to switch account");
+      }
+    } catch (err: any) {
+      setAuthError(err.message || "Failed to switch account");
     } finally {
       setIsAuthenticating(false);
     }
@@ -449,7 +683,14 @@ export default function App() {
       }
 
       // Re-fetch live shared cases
-      await fetchSharedCases();
+      await fetchSharedCases(false);
+
+      // Broadcast to other tabs/windows in same browser
+      try {
+        const bc = new BroadcastChannel("philips_portal_sync_bus");
+        bc.postMessage({ type: "REFRESH_CASES" });
+        bc.close();
+      } catch {}
 
       setNotification({
         type: "success",
@@ -507,11 +748,14 @@ export default function App() {
 
   // Export uploaded cases archive to Excel
   const handleExportUploadedCases = () => {
-    const modeCases = sharedCases.filter((c) => c.mode === formMode);
+    const modeCases =
+      formMode === "all"
+        ? sharedCases
+        : sharedCases.filter((c) => c.mode === formMode);
     if (modeCases.length === 0) {
       setNotification({
         type: "error",
-        message: `No ${formMode} records in archive to export.`
+        message: `No ${formMode === "all" ? "" : formMode} records in archive to export.`
       });
       setTimeout(() => setNotification(null), 3000);
       return;
@@ -519,7 +763,7 @@ export default function App() {
     exportUploadedCasesToExcel(modeCases, formMode);
     setNotification({
       type: "success",
-      message: `Exported ${modeCases.length} ${formMode} records to Excel with CRM Status & Remarks!`
+      message: `Exported ${modeCases.length} ${formMode === "all" ? "total" : formMode} records to Excel with CRM Status & Remarks!`
     });
     setTimeout(() => setNotification(null), 3000);
   };
@@ -562,7 +806,12 @@ export default function App() {
             ? `Case Approved! Unique Automated Token ID: ${assignedToken}`
             : `CRM status and remarks updated successfully!`
         });
-        await fetchSharedCases();
+        await fetchSharedCases(false);
+        try {
+          const bc = new BroadcastChannel("philips_portal_sync_bus");
+          bc.postMessage({ type: "REFRESH_CASES" });
+          bc.close();
+        } catch {}
         return true;
       } else {
         setNotification({
@@ -612,7 +861,10 @@ export default function App() {
     setTimeout(() => setNotification(null), 4000);
   };
 
-  const activeModeSharedCases = sharedCases.filter((c) => c.mode === formMode);
+  const activeModeSharedCases =
+    formMode === "all"
+      ? sharedCases
+      : sharedCases.filter((c) => c.mode === formMode);
 
   const getStatusBadge = (s: string) => {
     const norm = normalizeCrmStatus(s);
@@ -742,8 +994,35 @@ export default function App() {
                 </button>
               </div>
 
-              {/* Right: Role, Admin Access Switcher & Sign Out */}
+              {/* Right: Role, Live Sync Indicator, Admin Access Switcher & Sign Out */}
               <div className="flex items-center gap-2 sm:gap-3">
+                {/* Live Real-Time Multi-User Sync Indicator */}
+                <div
+                  id="nav-sync-indicator"
+                  className="hidden sm:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-white/5 border border-white/10 text-[11px] text-white/80 shadow-sm"
+                  title="Real-time multi-user synchronization active"
+                >
+                  <span className="relative flex h-2 w-2">
+                    <span
+                      className={`animate-ping absolute inline-flex h-full w-full rounded-full opacity-75 ${
+                        syncStatus === "connected"
+                          ? "bg-emerald-400"
+                          : "bg-amber-400"
+                      }`}
+                    />
+                    <span
+                      className={`relative inline-flex rounded-full h-2 w-2 ${
+                        syncStatus === "connected"
+                          ? "bg-emerald-500"
+                          : "bg-amber-500"
+                      }`}
+                    />
+                  </span>
+                  <span className="font-medium">
+                    {syncStatus === "connected" ? "Live Synced" : "Syncing..."}
+                  </span>
+                </div>
+
                 {/* Admin Access Manager Button */}
                 {isAdmin && (
                   <button
@@ -785,7 +1064,13 @@ export default function App() {
                 <button
                   id="nav-login-btn"
                   onClick={() => {
+                    try {
+                      localStorage.removeItem("philips_portal_session");
+                    } catch {}
                     setUserPassword("");
+                    setUserEmail("");
+                    setUserName("");
+                    setUserRole("fsm");
                     setViewState("LOGIN");
                     setNotification({
                       type: "success",
@@ -831,14 +1116,10 @@ export default function App() {
                 initial={{ opacity: 0, y: 15 }}
                 animate={{ opacity: 1, y: 0 }}
                 transition={{ delay: 0.1, duration: 0.7 }}
-                className="text-3xl sm:text-4xl md:text-5xl font-semibold text-white tracking-tight leading-[1.12] mb-3"
+                className="text-3xl sm:text-4xl md:text-5xl font-semibold text-white tracking-tight leading-[1.12] mb-6"
               >
                 Philips Cancellations & CRM Portal
               </motion.h1>
-
-              <p className="text-xs sm:text-sm text-white/60 mb-6 max-w-md">
-                Field Service Manager cases submission & CRM live operations review platform
-              </p>
 
               {/* Mode Switcher Tabs */}
               <div
@@ -970,6 +1251,103 @@ export default function App() {
                   )}
                 </button>
               </motion.form>
+
+              {/* Quick Multi-Account Switcher (Instant 1-Click Multi-User Sync Testing) */}
+              <motion.div
+                id="quick-demo-accounts-panel"
+                initial={{ opacity: 0, y: 15 }}
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ delay: 0.3, duration: 0.6 }}
+                className="w-full max-w-sm mt-5 p-3.5 rounded-2xl bg-white/[0.04] border border-white/10 backdrop-blur-md shadow-xl text-left"
+              >
+                <div className="flex items-center justify-between text-xs text-white/70 mb-2.5 px-0.5">
+                  <span className="font-semibold flex items-center gap-1.5 text-white/90">
+                    <Users className="w-3.5 h-3.5 text-sky-400" />
+                    Quick Accounts (Multi-User Collaboration)
+                  </span>
+                  <span className="text-[10px] text-emerald-400 font-mono">1-Click Sign In</span>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleQuickAccountSelect(
+                        "shekharphi785@gmail.com",
+                        "Shekhar (Admin)",
+                        "admin"
+                      )
+                    }
+                    className="p-2 rounded-xl bg-white/5 hover:bg-emerald-500/15 border border-white/10 hover:border-emerald-500/30 transition-all flex flex-col gap-0.5 cursor-pointer text-left group"
+                  >
+                    <span className="font-medium text-emerald-300 flex items-center gap-1">
+                      <Crown className="w-3 h-3 text-emerald-400" /> Admin (Shekhar)
+                    </span>
+                    <span className="text-[10px] text-white/40 group-hover:text-white/60 truncate">
+                      shekharphi785@gmail.com
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleQuickAccountSelect(
+                        "crm.lead@philips-service.com",
+                        "CRM Operations",
+                        "crm_editor"
+                      )
+                    }
+                    className="p-2 rounded-xl bg-white/5 hover:bg-sky-500/15 border border-white/10 hover:border-sky-500/30 transition-all flex flex-col gap-0.5 cursor-pointer text-left group"
+                  >
+                    <span className="font-medium text-sky-300 flex items-center gap-1">
+                      <ShieldCheck className="w-3 h-3 text-sky-400" /> CRM Reviewer
+                    </span>
+                    <span className="text-[10px] text-white/40 group-hover:text-white/60 truncate">
+                      crm.lead@philips-service.com
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleQuickAccountSelect(
+                        "rajesh.kumar@philips-fsm.com",
+                        "Rajesh Kumar (FSM)",
+                        "fsm"
+                      )
+                    }
+                    className="p-2 rounded-xl bg-white/5 hover:bg-amber-500/15 border border-white/10 hover:border-amber-500/30 transition-all flex flex-col gap-0.5 cursor-pointer text-left group"
+                  >
+                    <span className="font-medium text-amber-300 flex items-center gap-1">
+                      <UserPlus className="w-3 h-3 text-amber-400" /> FSM 1 (Rajesh)
+                    </span>
+                    <span className="text-[10px] text-white/40 group-hover:text-white/60 truncate">
+                      rajesh.kumar@philips-fsm.com
+                    </span>
+                  </button>
+
+                  <button
+                    type="button"
+                    onClick={() =>
+                      handleQuickAccountSelect(
+                        "amit.patel@philips-fsm.com",
+                        "Amit Patel (FSM)",
+                        "fsm"
+                      )
+                    }
+                    className="p-2 rounded-xl bg-white/5 hover:bg-purple-500/15 border border-white/10 hover:border-purple-500/30 transition-all flex flex-col gap-0.5 cursor-pointer text-left group"
+                  >
+                    <span className="font-medium text-purple-300 flex items-center gap-1">
+                      <UserPlus className="w-3 h-3 text-purple-400" /> FSM 2 (Amit)
+                    </span>
+                    <span className="text-[10px] text-white/40 group-hover:text-white/60 truncate">
+                      amit.patel@philips-fsm.com
+                    </span>
+                  </button>
+                </div>
+                <p className="text-[11px] text-white/45 text-center mt-2.5">
+                  💡 Tip: Open an Incognito window or 2nd tab to test live real-time sync between 2 different accounts!
+                </p>
+              </motion.div>
             </motion.div>
           )}
 
@@ -994,10 +1372,47 @@ export default function App() {
               </h2>
               <p
                 id="selection-subheading"
-                className="text-xs sm:text-sm text-white/60 mb-8 max-w-lg"
+                className="text-xs sm:text-sm text-white/60 mb-6 max-w-lg"
               >
                 Select an operational workflow. Cases submitted are synced in real time with the CRM Operations team.
               </p>
+
+              {/* Master Combined Live CRM Queue Card */}
+              <div
+                id="action-card-master-queue"
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  setFormMode("all");
+                  setMatrixTab("uploaded");
+                  setViewState("FORM_VIEW");
+                }}
+                className="w-full mb-5 liquid-glass rounded-2xl p-4 sm:p-5 text-left border border-sky-400/30 hover:border-sky-400/60 bg-gradient-to-r from-sky-500/10 via-blue-500/10 to-indigo-500/10 transition-all duration-300 group cursor-pointer shadow-lg hover:shadow-sky-500/10 flex items-center justify-between gap-4"
+              >
+                <div className="flex items-center gap-3.5">
+                  <div className="w-11 h-11 rounded-xl liquid-glass border border-sky-400/40 bg-sky-500/20 flex items-center justify-center shrink-0 group-hover:scale-105 transition-transform">
+                    <Layers className="w-5 h-5 text-sky-300" />
+                  </div>
+                  <div>
+                    <div className="flex items-center gap-2">
+                      <h3 className="text-base sm:text-lg text-white font-semibold group-hover:text-sky-200 transition-colors">
+                        All Operations & Master CRM Queue
+                      </h3>
+                      <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/20 text-emerald-300 border border-emerald-400/30">
+                        {sharedCases.length} Live Cases
+                      </span>
+                    </div>
+                    <p className="text-xs text-white/60 mt-0.5">
+                      Review all submitted cancellation & transfer cases from all accounts in one centralized live view.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2 shrink-0">
+                  <span className="text-xs font-semibold text-sky-300 group-hover:translate-x-1 transition-transform flex items-center gap-1">
+                    Open All Cases <ArrowRight className="w-3.5 h-3.5" />
+                  </span>
+                </div>
+              </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-5 w-full">
                 {/* Cancellation Option */}
@@ -1007,6 +1422,9 @@ export default function App() {
                   tabIndex={0}
                   onClick={() => {
                     setFormMode("cancellation");
+                    if (canEditCases) {
+                      setMatrixTab("uploaded");
+                    }
                     setViewState("FORM_VIEW");
                   }}
                   className="liquid-glass rounded-3xl p-6 sm:p-7 text-left border border-white/15 hover:border-white/40 hover:bg-white/[0.04] transition-all duration-300 group cursor-pointer flex flex-col justify-between min-h-[290px] relative overflow-hidden focus:outline-none focus:border-white/50 shadow-xl"
@@ -1024,16 +1442,36 @@ export default function App() {
                   </div>
 
                   <div className="relative z-10 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 text-xs font-semibold text-white/90 pt-4 border-t border-white/10 mt-5">
-                    <div className="flex items-center gap-2.5 bg-black/25 px-3 py-1.5 rounded-full border border-white/10">
-                      <span className="flex items-center gap-1.5 text-xs text-white/90">
-                        <span className="w-2 h-2 rounded-full bg-rose-400" />
-                        {cancellationRows.length} Active Buffer
-                      </span>
+                    <div className="flex items-center gap-2 bg-black/25 px-2.5 py-1.5 rounded-full border border-white/10">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormMode("cancellation");
+                          setMatrixTab("new");
+                          setViewState("FORM_VIEW");
+                        }}
+                        className="flex items-center gap-1.5 text-xs text-white/90 hover:text-white cursor-pointer"
+                        title="Open active buffer to submit new cases"
+                      >
+                        <Plus className="w-3 h-3 text-rose-400" />
+                        <span>{cancellationRows.length} Draft</span>
+                      </button>
                       <span className="text-white/25">|</span>
-                      <span className="flex items-center gap-1.5 text-xs text-emerald-300">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormMode("cancellation");
+                          setMatrixTab("uploaded");
+                          setViewState("FORM_VIEW");
+                        }}
+                        className="flex items-center gap-1.5 text-xs text-emerald-300 hover:text-emerald-200 cursor-pointer"
+                        title="View live submitted cases"
+                      >
                         <Archive className="w-3 h-3 text-emerald-400" />
-                        {sharedCases.filter((c) => c.mode === "cancellation").length} Shared
-                      </span>
+                        <span>{sharedCases.filter((c) => c.mode === "cancellation").length} Live</span>
+                      </button>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -1061,6 +1499,9 @@ export default function App() {
                   tabIndex={0}
                   onClick={() => {
                     setFormMode("transfer");
+                    if (canEditCases) {
+                      setMatrixTab("uploaded");
+                    }
                     setViewState("FORM_VIEW");
                   }}
                   className="liquid-glass rounded-3xl p-6 sm:p-7 text-left border border-white/15 hover:border-white/40 hover:bg-white/[0.04] transition-all duration-300 group cursor-pointer flex flex-col justify-between min-h-[290px] relative overflow-hidden focus:outline-none focus:border-white/50 shadow-xl"
@@ -1078,16 +1519,36 @@ export default function App() {
                   </div>
 
                   <div className="relative z-10 flex flex-wrap sm:flex-nowrap items-center justify-between gap-3 text-xs font-semibold text-white/90 pt-4 border-t border-white/10 mt-5">
-                    <div className="flex items-center gap-2.5 bg-black/25 px-3 py-1.5 rounded-full border border-white/10">
-                      <span className="flex items-center gap-1.5 text-xs text-white/90">
-                        <span className="w-2 h-2 rounded-full bg-sky-400" />
-                        {transferRows.length} Active Buffer
-                      </span>
+                    <div className="flex items-center gap-2 bg-black/25 px-2.5 py-1.5 rounded-full border border-white/10">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormMode("transfer");
+                          setMatrixTab("new");
+                          setViewState("FORM_VIEW");
+                        }}
+                        className="flex items-center gap-1.5 text-xs text-white/90 hover:text-white cursor-pointer"
+                        title="Open active buffer to submit new transfer cases"
+                      >
+                        <Plus className="w-3 h-3 text-sky-400" />
+                        <span>{transferRows.length} Draft</span>
+                      </button>
                       <span className="text-white/25">|</span>
-                      <span className="flex items-center gap-1.5 text-xs text-emerald-300">
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setFormMode("transfer");
+                          setMatrixTab("uploaded");
+                          setViewState("FORM_VIEW");
+                        }}
+                        className="flex items-center gap-1.5 text-xs text-emerald-300 hover:text-emerald-200 cursor-pointer"
+                        title="View live submitted transfer cases"
+                      >
                         <Archive className="w-3 h-3 text-emerald-400" />
-                        {sharedCases.filter((c) => c.mode === "transfer").length} Shared
-                      </span>
+                        <span>{sharedCases.filter((c) => c.mode === "transfer").length} Live</span>
+                      </button>
                     </div>
                     <div className="flex items-center gap-2 shrink-0">
                       <button
@@ -1152,35 +1613,57 @@ export default function App() {
 
                   <div className="h-6 w-px bg-white/20 hidden sm:block" />
 
-                  {/* Mode Tabs: Cancellation vs Transfer */}
+                  {/* Mode Tabs: All vs Cancellation vs Transfer */}
                   <div
                     id="form-mode-tabs"
                     className="liquid-glass rounded-full p-1 flex items-center border border-white/10"
                   >
                     <button
+                      id="tab-all-mode"
+                      onClick={() => setFormMode("all")}
+                      className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
+                        formMode === "all"
+                          ? "bg-white/20 text-white shadow-sm border border-white/25"
+                          : "text-white/60 hover:text-white"
+                      }`}
+                    >
+                      <Layers className="w-3.5 h-3.5 text-blue-400" />
+                      <span>All Cases</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-blue-500/25 text-blue-200 font-mono">
+                        {sharedCases.length}
+                      </span>
+                    </button>
+
+                    <button
                       id="tab-cancellation-mode"
                       onClick={() => setFormMode("cancellation")}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer flex items-center gap-2 ${
+                      className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
                         formMode === "cancellation"
                           ? "bg-white/20 text-white shadow-sm border border-white/25"
                           : "text-white/60 hover:text-white"
                       }`}
                     >
                       <XCircle className="w-3.5 h-3.5 text-red-400" />
-                      <span>Cancellation Cases</span>
+                      <span>Cancellations</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-red-500/25 text-red-200 font-mono">
+                        {sharedCases.filter((c) => c.mode === "cancellation").length}
+                      </span>
                     </button>
 
                     <button
                       id="tab-transfer-mode"
                       onClick={() => setFormMode("transfer")}
-                      className={`px-3.5 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer flex items-center gap-2 ${
+                      className={`px-3 py-1.5 rounded-full text-xs font-semibold transition-all cursor-pointer flex items-center gap-1.5 ${
                         formMode === "transfer"
                           ? "bg-white/20 text-white shadow-sm border border-white/25"
                           : "text-white/60 hover:text-white"
                       }`}
                     >
                       <ArrowRightLeft className="w-3.5 h-3.5 text-sky-400" />
-                      <span>Transfer Cases</span>
+                      <span>Transfers</span>
+                      <span className="text-[10px] px-1.5 py-0.2 rounded-full bg-sky-500/25 text-sky-200 font-mono">
+                        {sharedCases.filter((c) => c.mode === "transfer").length}
+                      </span>
                     </button>
                   </div>
 
@@ -1237,9 +1720,17 @@ export default function App() {
                       {/* Download Template */}
                       <button
                         id="download-template-action-btn"
-                        onClick={() => downloadExcelTemplate(formMode)}
+                        onClick={() =>
+                          downloadExcelTemplate(
+                            formMode === "all" ? "cancellation" : formMode
+                          )
+                        }
                         className="liquid-glass rounded-full px-3 py-2 text-xs font-medium text-white/90 hover:bg-white/15 transition-all flex items-center gap-1.5 border border-white/15 cursor-pointer shadow-sm active:scale-95"
-                        title={`Download official ${formMode} Excel template (.xlsx)`}
+                        title={
+                          formMode === "all"
+                            ? "Download official Excel template (.xlsx)"
+                            : `Download official ${formMode} Excel template (.xlsx)`
+                        }
                       >
                         <Download className="w-3.5 h-3.5 text-sky-300" />
                         <span className="hidden sm:inline">Template</span>
@@ -1287,12 +1778,18 @@ export default function App() {
                     </>
                   ) : (
                     <>
+                      {/* Live Sync Status indicator in table header */}
+                      <div className="hidden lg:flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-black/40 border border-white/10 text-[11px] text-white/70">
+                        <span className={`w-1.5 h-1.5 rounded-full ${syncStatus === 'connected' ? 'bg-emerald-400 animate-pulse' : 'bg-amber-400'}`} />
+                        <span>Live Sync Active</span>
+                      </div>
+
                       {/* Refresh Button */}
                       <button
-                        onClick={fetchSharedCases}
+                        onClick={() => fetchSharedCases(true)}
                         disabled={isLoadingCases}
                         className="p-2 rounded-full liquid-glass border border-white/20 text-white/80 hover:text-white transition-colors cursor-pointer"
-                        title="Refresh Live CRM Cases"
+                        title="Force Refresh Live CRM Cases"
                       >
                         <RefreshCw
                           className={`w-3.5 h-3.5 ${
@@ -1804,14 +2301,17 @@ export default function App() {
                               <Archive className="w-6 h-6 text-white/40" />
                             </div>
                             <span className="text-sm font-medium text-white/80">
-                              No {formMode} cases submitted yet
+                              No {formMode === "all" ? "" : formMode} cases submitted yet
                             </span>
                             <p className="text-xs text-white/40 max-w-sm">
                               When FSMs submit case batches, they will appear here in real time for CRM team review and remark updates.
                             </p>
                             <button
-                              onClick={() => setMatrixTab("new")}
-                              className="mt-2 px-4 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-xs font-semibold text-white flex items-center gap-1.5 border border-white/15"
+                              onClick={() => {
+                                setFormMode(formMode === "all" ? "cancellation" : formMode);
+                                setMatrixTab("new");
+                              }}
+                              className="mt-2 px-4 py-1.5 rounded-full bg-white/10 hover:bg-white/20 text-xs font-semibold text-white flex items-center gap-1.5 border border-white/15 cursor-pointer"
                             >
                               <Plus className="w-3.5 h-3.5 text-emerald-400" />
                               <span>Submit Cases</span>
@@ -1826,7 +2326,7 @@ export default function App() {
                           <div className="flex items-center justify-between px-3 py-2 text-xs text-white/60 border-b border-white/10 mb-2">
                             <span>
                               Showing <strong>{filtered.length}</strong> of{" "}
-                              <strong>{activeModeSharedCases.length}</strong> {formMode} records
+                              <strong>{activeModeSharedCases.length}</strong> {formMode === "all" ? "total" : formMode} records
                             </span>
                             <span className="text-[11px] text-white/40">
                               {canEditCases
@@ -1842,6 +2342,9 @@ export default function App() {
                             <thead>
                               <tr className="border-b border-white/15 text-white/70 uppercase tracking-wider font-semibold text-[11px] sticky top-0 bg-[#0B1528]/80 backdrop-blur-md z-10">
                                 <th className="py-3 px-3 w-10 text-center">#</th>
+                                {formMode === "all" && (
+                                  <th className="py-3 px-3 min-w-[100px]">Type</th>
+                                )}
                                 <th className="py-3 px-3 min-w-[130px]">Customer</th>
                                 <th className="py-3 px-3 min-w-[100px]">Case #</th>
                                 <th className="py-3 px-3 min-w-[100px]">Work Order</th>
@@ -1849,7 +2352,9 @@ export default function App() {
                                 <th className="py-3 px-3 min-w-[160px]">
                                   {formMode === "cancellation"
                                     ? "Cancellation Reason"
-                                    : "Transfer Details"}
+                                    : formMode === "transfer"
+                                    ? "Transfer Details"
+                                    : "Reason / Details"}
                                 </th>
                                 <th className="py-3 px-3 min-w-[120px] text-center">
                                   CRM Status
@@ -1868,7 +2373,7 @@ export default function App() {
                               {filtered.length === 0 ? (
                                 <tr>
                                   <td
-                                    colSpan={11}
+                                    colSpan={formMode === "all" ? 12 : 11}
                                     className="py-10 text-center text-white/40"
                                   >
                                     No records matching filter or search query.
@@ -1884,6 +2389,19 @@ export default function App() {
                                     <td className="py-2.5 px-3 text-center text-white/40 font-mono">
                                       {index + 1}
                                     </td>
+                                    {formMode === "all" && (
+                                      <td className="py-2.5 px-3">
+                                        <span
+                                          className={`inline-flex items-center gap-1 px-2.5 py-0.5 rounded-full text-[10px] font-semibold border ${
+                                            row.mode === "cancellation"
+                                              ? "bg-rose-500/20 text-rose-300 border-rose-500/30"
+                                              : "bg-sky-500/20 text-sky-300 border-sky-500/30"
+                                          }`}
+                                        >
+                                          {row.mode === "cancellation" ? "Cancellation" : "Transfer"}
+                                        </span>
+                                      </td>
+                                    )}
                                     <td className="py-2.5 px-3 text-white font-medium">
                                       {row.customerName || "—"}
                                     </td>
@@ -1900,7 +2418,7 @@ export default function App() {
                                       </div>
                                     </td>
                                     <td className="py-2.5 px-3 text-white/70 max-w-xs">
-                                      {formMode === "cancellation" ? (
+                                      {row.mode === "cancellation" ? (
                                         <p className="truncate" title={row.cancellationReason}>
                                           {row.cancellationReason || "—"}
                                         </p>
@@ -2037,7 +2555,7 @@ export default function App() {
       <ExcelUploadModal
         isOpen={isUploadModalOpen}
         onClose={() => setIsUploadModalOpen(false)}
-        formMode={formMode}
+        formMode={formMode === "all" ? "cancellation" : formMode}
         onApplySingleMode={handleApplySingleImportedRows}
         onApplyBothModes={handleApplyBothImportedRows}
       />

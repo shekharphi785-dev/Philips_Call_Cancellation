@@ -83,6 +83,8 @@ export const UserManagementModal: React.FC<UserManagementModalProps> = ({
   useEffect(() => {
     if (isOpen) {
       fetchUsers();
+      const interval = setInterval(fetchUsers, 3000);
+      return () => clearInterval(interval);
     }
   }, [isOpen]);
 

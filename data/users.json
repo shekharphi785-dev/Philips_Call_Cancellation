@@ -1,0 +1,30 @@
+[
+  {
+    "email": "shekharphi785@gmail.com",
+    "name": "Shekhar (Admin)",
+    "role": "admin",
+    "addedAt": "2026-08-01T00:00:00.000Z",
+    "addedBy": "System Root"
+  },
+  {
+    "email": "crm.lead@philips-service.com",
+    "name": "CRM Operations Team",
+    "role": "crm_editor",
+    "addedAt": "2026-08-01T00:00:00.000Z",
+    "addedBy": "shekharphi785@gmail.com"
+  },
+  {
+    "email": "rajesh.kumar@philips-fsm.com",
+    "name": "Rajesh Kumar (FSM)",
+    "role": "fsm",
+    "addedAt": "2026-08-01T00:00:00.000Z",
+    "addedBy": "System"
+  },
+  {
+    "email": "amit.patel@philips-fsm.com",
+    "name": "Amit Patel (FSM)",
+    "role": "fsm",
+    "addedAt": "2026-08-01T00:00:00.000Z",
+    "addedBy": "System"
+  }
+]

@@ -1,5 +1,40 @@
 [
   {
+    "id": "case-1790498822795-cg6e6",
+    "mode": "cancellation",
+    "customerName": "Sync Verification Medical Center",
+    "caseNumber": "CAS-SYNC-999",
+    "workOrderNumber": "WO-SYNC-888",
+    "workshop": "Philips Tech Lab",
+    "branch": "North Zone",
+    "caseRegistrationDate": "2026-09-27",
+    "cancellationReason": "Multi-account sync verified",
+    "submittedAt": "2026-09-27T08:47:02.795Z",
+    "submittedBy": "Rajesh Kumar (FSM)",
+    "submitterEmail": "rajesh.kumar@philips-fsm.com",
+    "batchId": "BATCH-SYNC-TEST",
+    "crmStatus": "Pending",
+    "crmRemarks": "Awaiting CRM team review & SAP verification."
+  },
+  {
+    "id": "row-1790498004617",
+    "mode": "transfer",
+    "customerName": "Test",
+    "caseNumber": "Test",
+    "workOrderNumber": "TEst",
+    "workshop": "TEst",
+    "branch": "TEst",
+    "caseRegistrationDate": "2026-09-27",
+    "transferReason": "TEs",
+    "workshopToAssign": "test",
+    "submittedAt": "2026-09-27T08:35:46.806Z",
+    "submittedBy": "Shekhar (Admin)",
+    "submitterEmail": "shekharphi785@gmail.com",
+    "batchId": "BATCH-1790498137019",
+    "crmStatus": "Pending",
+    "crmRemarks": "Awaiting CRM team review & SAP verification."
+  },
+  {
     "id": "seed-case-101",
     "mode": "cancellation",
     "customerName": "Apollo Multispecialty Hospitals",
@@ -33,10 +68,11 @@
     "submittedBy": "Amit Patel (FSM)",
     "submitterEmail": "amit.patel@philips-fsm.com",
     "batchId": "BATCH-AUG30-02",
-    "crmStatus": "Pending",
-    "crmRemarks": "Checking alternate inventory stock from Bengaluru central depot before final cancellation approval.",
-    "crmUpdatedBy": "Shekhar (Admin)",
-    "crmUpdatedAt": "2026-09-09T14:18:51.276Z"
+    "crmStatus": "Approved",
+    "crmRemarks": "Sync test approval: 1790498433462",
+    "crmUpdatedBy": "Shekhar Test",
+    "crmUpdatedAt": "2026-09-27T08:40:33.551Z",
+    "tokenId": "100002"
   },
   {
     "id": "seed-case-103",

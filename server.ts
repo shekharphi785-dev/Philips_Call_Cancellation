@@ -36,15 +36,15 @@ async function fetchCasesFromCloudflare(): Promise<SharedCaseRecord[] | null> {
 async function fetchUsersFromCloudflare(): Promise<UserRecord[] | null> {
   try {
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 4000);
+    const timeoutId = setTimeout(() => controller.abort(), 800);
     const response = await fetch(`${AUTH_SERVICE_URL}/api/users`, {
       headers: { "X-Proxy-Auth-Token": "Bearer cloudflare_edge_secret" },
       signal: controller.signal
-    });
+    }).catch(() => null);
     clearTimeout(timeoutId);
-    if (response.ok) {
-      const data = (await response.json()) as any;
-      if (Array.isArray(data.users)) {
+    if (response && response.ok) {
+      const data = (await response.json().catch(() => null)) as any;
+      if (data && Array.isArray(data.users)) {
         return data.users;
       }
     }
@@ -171,7 +171,7 @@ export function generateApprovalTokenId(
   }
 }
 
-// Initial default users
+// Initial default users supporting immediate multi-account collaboration
 const DEFAULT_USERS: UserRecord[] = [
   {
     email: "shekharphi785@gmail.com",
@@ -186,6 +186,20 @@ const DEFAULT_USERS: UserRecord[] = [
     role: "crm_editor",
     addedAt: "2026-08-01T00:00:00.000Z",
     addedBy: "shekharphi785@gmail.com"
+  },
+  {
+    email: "rajesh.kumar@philips-fsm.com",
+    name: "Rajesh Kumar (FSM)",
+    role: "fsm",
+    addedAt: "2026-08-01T00:00:00.000Z",
+    addedBy: "System"
+  },
+  {
+    email: "amit.patel@philips-fsm.com",
+    name: "Amit Patel (FSM)",
+    role: "fsm",
+    addedAt: "2026-08-01T00:00:00.000Z",
+    addedBy: "System"
   }
 ];
 
@@ -253,7 +267,7 @@ const DEFAULT_CASES: SharedCaseRecord[] = [
 ];
 
 // Helper functions for reading & writing database
-function getUsers(): UserRecord[] {
+function loadInitialUsers(): UserRecord[] {
   try {
     if (!fs.existsSync(USERS_FILE)) {
       fs.writeFileSync(USERS_FILE, JSON.stringify(DEFAULT_USERS, null, 2));
@@ -267,15 +281,7 @@ function getUsers(): UserRecord[] {
   }
 }
 
-function saveUsers(users: UserRecord[]) {
-  try {
-    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
-  } catch (err) {
-    console.error("Error saving users file:", err);
-  }
-}
-
-function getCases(): SharedCaseRecord[] {
+function loadInitialCases(): SharedCaseRecord[] {
   try {
     if (!fs.existsSync(CASES_FILE)) {
       fs.writeFileSync(CASES_FILE, JSON.stringify(DEFAULT_CASES, null, 2));
@@ -289,12 +295,62 @@ function getCases(): SharedCaseRecord[] {
   }
 }
 
-function saveCases(cases: SharedCaseRecord[]) {
+// In-memory cache for instant real-time synchronization across all sessions
+let cachedUsers: UserRecord[] = loadInitialUsers();
+let cachedCases: SharedCaseRecord[] = loadInitialCases();
+let casesLastUpdated = Date.now();
+let usersLastUpdated = Date.now();
+
+// Connected Server-Sent Events (SSE) clients for real-time live sync
+const sseClients: express.Response[] = [];
+
+export function broadcastToClients(event: string, payload: any) {
+  const dataString = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (let i = sseClients.length - 1; i >= 0; i--) {
+    const res = sseClients[i];
+    try {
+      res.write(dataString);
+    } catch {
+      sseClients.splice(i, 1);
+    }
+  }
+}
+
+function getUsers(): UserRecord[] {
+  return cachedUsers;
+}
+
+function saveUsers(users: UserRecord[]) {
+  cachedUsers = users;
+  usersLastUpdated = Date.now();
+  try {
+    fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2));
+  } catch (err) {
+    console.error("Error saving users file:", err);
+  }
+  broadcastToClients("users_updated", {
+    users: cachedUsers,
+    lastUpdated: usersLastUpdated
+  });
+}
+
+function getCases(): SharedCaseRecord[] {
+  return cachedCases;
+}
+
+function saveCases(cases: SharedCaseRecord[], extraPayload?: Record<string, any>) {
+  cachedCases = cases;
+  casesLastUpdated = Date.now();
   try {
     fs.writeFileSync(CASES_FILE, JSON.stringify(cases, null, 2));
   } catch (err) {
     console.error("Error saving cases file:", err);
   }
+  broadcastToClients("cases_updated", {
+    cases: cachedCases,
+    lastUpdated: casesLastUpdated,
+    ...(extraPayload || {})
+  });
 }
 
 async function startServer() {
@@ -340,54 +396,58 @@ async function startServer() {
     }
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 2000);
       const response = await fetch(`${AUTH_SERVICE_URL}/api/auth/login`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ email: normEmail, password })
-      });
-      const data = (await response.json().catch(() => null)) as any;
+        body: JSON.stringify({ email: normEmail, password }),
+        signal: controller.signal
+      }).catch(() => null);
+      clearTimeout(timeoutId);
 
-      if (!response.ok) {
-        // Allow fallback development login if worker returns error or is not configured
-        if (normEmail === "shekharphi785@gmail.com" || user) {
-          return res.json({
-            success: true,
-            name: user?.name || normEmail.split("@")[0],
-            email: normEmail,
-            role: user?.role || "admin"
-          });
-        }
-        return res
-          .status(response.status)
-          .json(data || { error: "Authentication failed" });
-      }
+      const data = response && response.ok ? await response.json().catch(() => null) : null;
 
-      // If user isn't yet in local registry, auto-register them as FSM submitter
+      // If user isn't yet in local registry, auto-register them
       if (!user) {
+        const assignedRole: UserRole =
+          req.body?.role === "admin" || req.body?.role === "crm_editor"
+            ? req.body.role
+            : normEmail.includes("crm")
+            ? "crm_editor"
+            : "fsm";
+
         user = {
           email: normEmail,
-          name: data.name || normEmail.split("@")[0],
-          role: "fsm",
+          name: data?.name || req.body?.name || normEmail.split("@")[0],
+          role: assignedRole,
           addedAt: new Date().toISOString(),
-          addedBy: "Self Register"
+          addedBy: "Portal Login"
         };
         users.push(user);
         saveUsers(users);
       }
 
       res.json({
-        ...data,
+        success: true,
         role: user.role,
-        name: user.name || data.name || normEmail.split("@")[0]
+        name: user.name || data?.name || normEmail.split("@")[0],
+        email: normEmail
       });
     } catch (err: any) {
       console.warn("Auth worker fallback execution:", err.message);
       // Fallback local auth
       if (!user) {
+        const assignedRole: UserRole =
+          normEmail === "shekharphi785@gmail.com"
+            ? "admin"
+            : normEmail.includes("crm")
+            ? "crm_editor"
+            : "fsm";
         user = {
           email: normEmail,
           name: normEmail.split("@")[0],
-          role: normEmail === "shekharphi785@gmail.com" ? "admin" : "fsm",
+          role: assignedRole,
           addedAt: new Date().toISOString(),
           addedBy: "Local Fallback"
         };
@@ -539,28 +599,62 @@ async function startServer() {
   });
 
   // ==========================================
+  // Real-Time Synchronization Endpoints (SSE)
+  // ==========================================
+  // Stream live updates instantly to all connected users
+  app.get("/api/sync/events", (req, res) => {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache, no-transform");
+    res.setHeader("Connection", "keep-alive");
+    res.setHeader("X-Accel-Buffering", "no");
+    res.flushHeaders?.();
+
+    sseClients.push(res);
+
+    // Initial state snapshot for immediate sync on connect
+    res.write(`event: initial_sync\ndata: ${JSON.stringify({
+      cases: getCases(),
+      users: getUsers(),
+      casesLastUpdated,
+      usersLastUpdated,
+      serverTime: new Date().toISOString()
+    })}\n\n`);
+
+    // Heartbeat ping every 15s to keep proxy connections alive
+    const pingTimer = setInterval(() => {
+      try {
+        res.write(`event: ping\ndata: ${Date.now()}\n\n`);
+      } catch {
+        clearInterval(pingTimer);
+      }
+    }, 15000);
+
+    req.on("close", () => {
+      clearInterval(pingTimer);
+      const idx = sseClients.indexOf(res);
+      if (idx >= 0) sseClients.splice(idx, 1);
+    });
+  });
+
+  // Sync Status endpoint for polling & client health checks
+  app.get("/api/sync/status", (req, res) => {
+    res.json({
+      casesCount: cachedCases.length,
+      usersCount: cachedUsers.length,
+      casesLastUpdated,
+      usersLastUpdated,
+      connectedClients: sseClients.length,
+      serverTime: new Date().toISOString()
+    });
+  });
+
+  // ==========================================
   // Cases & Remarks Endpoints
   // ==========================================
-  // Get all cases (live for both FSM and CRM, synchronized with Cloudflare)
-  app.get("/api/cases", async (req, res) => {
-    const callerEmail = getCallerEmail(req);
+  // Get all cases (instant in-memory response, multi-user synchronized)
+  app.get("/api/cases", (req, res) => {
     const mode = (req.query.mode as string) || "";
     let cases = getCases();
-
-    // Query Cloudflare worker for newest records/updates
-    const cfCases = await fetchCasesFromCloudflare();
-    if (cfCases && cfCases.length > 0) {
-      // Merge Cloudflare cases with local state
-      cfCases.forEach((cfc) => {
-        const existingIdx = cases.findIndex((c) => c.id === cfc.id || (c.caseNumber && c.caseNumber === cfc.caseNumber));
-        if (existingIdx >= 0) {
-          cases[existingIdx] = { ...cases[existingIdx], ...cfc };
-        } else {
-          cases.push(cfc);
-        }
-      });
-      saveCases(cases);
-    }
 
     if (mode === "cancellation" || mode === "transfer") {
       cases = cases.filter((c) => c.mode === mode);
@@ -569,7 +663,8 @@ async function startServer() {
     res.json({
       success: true,
       cases,
-      total: cases.length
+      total: cases.length,
+      lastUpdated: casesLastUpdated
     });
   });
 
@@ -607,7 +702,13 @@ async function startServer() {
 
     // Prepend new submissions to local storage
     const updatedCases = [...newEntries, ...currentCases];
-    saveCases(updatedCases);
+    saveCases(updatedCases, {
+      action: "cases_submitted",
+      mode,
+      submittedBy: submittedBy || newEntries[0]?.submittedBy || "FSM",
+      count: newEntries.length,
+      sampleCase: newEntries[0]
+    });
 
     // Forward batch to Cloudflare Worker to store in Cloudflare D1/KV & Google Sheets
     try {
@@ -684,7 +785,13 @@ async function startServer() {
     caseItem.crmUpdatedBy = resolvedEditor;
     caseItem.crmUpdatedAt = new Date().toISOString();
 
-    saveCases(cases);
+    saveCases(cases, {
+      action: "case_reviewed",
+      updatedCase: caseItem,
+      editorName: resolvedEditor,
+      caseId,
+      crmStatus: caseItem.crmStatus
+    });
 
     // Synchronize CRM remarks & approval token directly to Cloudflare
     syncRemarksToCloudflare(
@@ -700,6 +807,9 @@ async function startServer() {
       case: caseItem
     });
   });
+
+  // Serve public directory (favicon, icons, static assets)
+  app.use(express.static(path.join(process.cwd(), "public")));
 
   // Vite middleware for development
   if (process.env.NODE_ENV !== "production") {

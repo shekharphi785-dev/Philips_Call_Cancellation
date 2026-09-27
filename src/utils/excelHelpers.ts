@@ -217,9 +217,62 @@ export function downloadExcelTemplate(mode: "cancellation" | "transfer" | "maste
  */
 export function exportUploadedCasesToExcel(
   records: any[],
-  mode: "cancellation" | "transfer"
+  mode: "cancellation" | "transfer" | "all"
 ) {
   if (!records || records.length === 0) return;
+
+  if (mode === "all") {
+    const wb = XLSX.utils.book_new();
+    const cancellations = records.filter((r) => r.mode === "cancellation");
+    const transfers = records.filter((r) => r.mode === "transfer");
+
+    if (cancellations.length > 0) {
+      const mappedCanc = cancellations.map((r) => ({
+        "Customer Name": r.customerName || "",
+        "Case Number": r.caseNumber || "",
+        "Work Order Number": r.workOrderNumber || "",
+        "Workshop": r.workshop || "",
+        "Branch": r.branch || "",
+        "Case Registration Date": r.caseRegistrationDate || "",
+        "Cancellation Reason": r.cancellationReason || "",
+        "Submitted At": r.submittedAt ? new Date(r.submittedAt).toLocaleString() : "",
+        "Submitted By": r.submittedBy || "",
+        "CRM Status": r.crmStatus || r.status || "Pending",
+        "Token ID": r.tokenId || "—",
+        "CRM Remarks": r.crmRemarks || "Awaiting CRM team review",
+        "CRM Updated By": r.crmUpdatedBy || "-",
+        "CRM Updated At": r.crmUpdatedAt ? new Date(r.crmUpdatedAt).toLocaleString() : "-"
+      }));
+      const wsCanc = XLSX.utils.json_to_sheet(mappedCanc);
+      XLSX.utils.book_append_sheet(wb, wsCanc, "Cancellations");
+    }
+
+    if (transfers.length > 0) {
+      const mappedTrans = transfers.map((r) => ({
+        "Customer Name": r.customerName || "",
+        "Case Number": r.caseNumber || "",
+        "Work Order Number": r.workOrderNumber || "",
+        "Workshop": r.workshop || "",
+        "Branch": r.branch || "",
+        "Case Registration Date": r.caseRegistrationDate || "",
+        "Workshop to Assign": r.workshopToAssign || "",
+        "Transfer Reason": r.transferReason || "",
+        "Submitted At": r.submittedAt ? new Date(r.submittedAt).toLocaleString() : "",
+        "Submitted By": r.submittedBy || "",
+        "CRM Status": r.crmStatus || r.status || "Pending",
+        "Token ID": r.tokenId || "—",
+        "CRM Remarks": r.crmRemarks || "Awaiting CRM team review",
+        "CRM Updated By": r.crmUpdatedBy || "-",
+        "CRM Updated At": r.crmUpdatedAt ? new Date(r.crmUpdatedAt).toLocaleString() : "-"
+      }));
+      const wsTrans = XLSX.utils.json_to_sheet(mappedTrans);
+      XLSX.utils.book_append_sheet(wb, wsTrans, "Transfers");
+    }
+
+    const fileName = `Philips_Master_Cases_Export_${new Date().toISOString().split("T")[0]}.xlsx`;
+    XLSX.writeFile(wb, fileName);
+    return;
+  }
 
   const isCancellation = mode === "cancellation";
   const mapped = records.map((r) => {
